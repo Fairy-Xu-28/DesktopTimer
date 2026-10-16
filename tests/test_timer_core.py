@@ -10,7 +10,14 @@ from __future__ import annotations
 
 import unittest
 
-from timer_core import State, Stopwatch, format_hms
+from timer_core import (
+    MAX_COUNTDOWN_SECONDS,
+    Countdown,
+    State,
+    Stopwatch,
+    format_hms,
+    parse_hms,
+)
 
 
 class FakeClock:
@@ -221,6 +228,268 @@ class PrecisionTest(unittest.TestCase):
             clock.advance(0.1)
             watch.pause()
         self.assertAlmostEqual(watch.total_seconds(), 100.0, delta=1e-6)
+
+
+def make_countdown(target: int = 10) -> tuple[Countdown, FakeClock]:
+    """造一个由假时钟驱动、设定时长 ``target`` 秒的倒计时。"""
+    clock = FakeClock()
+    return Countdown(clock=clock, target=target), clock
+
+
+class CountdownStateTest(unittest.TestCase):
+    """倒计时:开始 / 暂停 / 继续 / 重置 的语义。"""
+
+    def setUp(self) -> None:
+        self.countdown, self.clock = make_countdown(10)
+
+    def test_initial_state_is_idle_at_the_full_duration(self) -> None:
+        self.assertIs(self.countdown.state, State.IDLE)
+        self.assertFalse(self.countdown.is_running())
+        self.assertEqual(self.countdown.remaining_seconds(), 10.0)
+        self.assertEqual(self.countdown.formatted(), "00:00:10")
+        self.assertEqual(self.countdown.target(), 10)
+
+    def test_remaining_decreases_while_running(self) -> None:
+        """计时中读数要**跟着时钟走**,不能等到暂停才更新。
+
+        曾经写错过:读数只拿"已结算的累计秒数"去减,而那个值只在暂停时才更新。
+        于是计时中的倒计时读数一直卡在设定时长不动(跑满 3 秒还显示 00:00:10),
+        一暂停却突然跳到正确值 —— 表现得像读数慢了一拍。
+        """
+        self.countdown.start()
+        self.clock.advance(3.0)
+        self.assertEqual(self.countdown.remaining_seconds(), 7.0)
+        self.assertEqual(self.countdown.formatted(), "00:00:07")
+        self.clock.advance(2.0)
+        self.assertEqual(self.countdown.remaining_seconds(), 5.0)
+
+    def test_pause_freezes_the_reading(self) -> None:
+        self.countdown.start()
+        self.clock.advance(4.0)
+        self.assertTrue(self.countdown.pause())
+        self.clock.advance(100.0)   # 暂停期间时钟照走,读数不该动
+        self.assertEqual(self.countdown.remaining_seconds(), 6.0)
+        self.assertIs(self.countdown.state, State.PAUSED)
+
+    def test_resume_continues_from_where_it_paused(self) -> None:
+        self.countdown.start()
+        self.clock.advance(4.0)
+        self.countdown.pause()
+        self.clock.advance(50.0)
+        self.assertTrue(self.countdown.start())
+        self.clock.advance(2.0)
+        self.assertEqual(self.countdown.remaining_seconds(), 4.0)
+
+    def test_repeated_start_keeps_the_remaining_time(self) -> None:
+        self.countdown.start()
+        self.clock.advance(3.0)
+        self.assertFalse(self.countdown.start())   # 已在跑,忽略
+        self.clock.advance(2.0)
+        self.assertEqual(self.countdown.remaining_seconds(), 5.0)
+
+    def test_repeated_pause_is_ignored(self) -> None:
+        self.countdown.start()
+        self.clock.advance(3.0)
+        self.assertTrue(self.countdown.pause())
+        self.assertFalse(self.countdown.pause())
+
+    def test_reset_returns_to_the_target_not_to_zero(self) -> None:
+        """倒计时里"重置"是**重新来一遍**,不是归零 —— 和秒表正好相反。"""
+        self.countdown.start()
+        self.clock.advance(6.0)
+        self.assertTrue(self.countdown.reset())
+        self.assertIs(self.countdown.state, State.IDLE)
+        self.assertEqual(self.countdown.formatted(), "00:00:10")
+
+    def test_reset_is_idempotent(self) -> None:
+        self.countdown.reset()
+        self.assertFalse(self.countdown.reset())   # 本来就在起点上
+
+    def test_toggle_starts_then_pauses(self) -> None:
+        self.countdown.toggle()
+        self.assertIs(self.countdown.state, State.RUNNING)
+        self.countdown.toggle()
+        self.assertIs(self.countdown.state, State.PAUSED)
+
+    def test_set_target_only_while_stopped(self) -> None:
+        self.assertTrue(self.countdown.set_target(60))
+        self.assertEqual(self.countdown.target(), 60)
+        self.assertEqual(self.countdown.formatted(), "00:01:00")
+
+        self.countdown.start()
+        self.assertFalse(self.countdown.set_target(30))   # 跑着的时候不给改
+        self.assertEqual(self.countdown.target(), 60)
+
+    def test_set_target_resets_progress(self) -> None:
+        self.countdown.start()
+        self.clock.advance(5.0)
+        self.countdown.pause()
+        self.countdown.set_target(20)
+        self.assertEqual(self.countdown.remaining_seconds(), 20.0)
+
+    def test_rejects_invalid_targets(self) -> None:
+        for bad in (0, -1, MAX_COUNTDOWN_SECONDS + 1):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.countdown.set_target(bad)
+
+    def test_rejects_non_integer_targets(self) -> None:
+        # bool 是 int 的子类,不专门排除的话 True 会被当成 1 秒
+        for bad in (True, 1.5, "60", None):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.countdown.set_target(bad)  # type: ignore[arg-type]
+
+    def test_two_instances_do_not_share_state(self) -> None:
+        other, _ = make_countdown(30)
+        self.countdown.start()
+        self.clock.advance(4.0)
+        self.assertEqual(other.formatted(), "00:00:30")
+
+
+class CountdownFinishTest(unittest.TestCase):
+    """数到 0 之后会发生什么。"""
+
+    def setUp(self) -> None:
+        self.countdown, self.clock = make_countdown(10)
+
+    def test_reaching_zero_settles_to_idle(self) -> None:
+        """跑完之后状态要自己落回就绪,不能一直挂着"计时中"。
+
+        不落定的话 ``is_running()`` 永远为真、按钮上永远写着"暂停",
+        一个已经跑完的倒计时看起来像是卡死了。
+        """
+        self.countdown.start()
+        self.clock.advance(10.0)
+        self.assertIs(self.countdown.state, State.IDLE)
+        self.assertFalse(self.countdown.is_running())
+        self.assertEqual(self.countdown.formatted(), "00:00:00")
+
+    def test_is_finished_only_after_it_actually_ran_down(self) -> None:
+        self.assertFalse(self.countdown.is_finished())      # 刚建出来
+        self.countdown.start()
+        self.assertFalse(self.countdown.is_finished())      # 跑着
+        self.clock.advance(10.0)
+        self.assertTrue(self.countdown.is_finished())
+        self.countdown.reset()
+        self.assertFalse(self.countdown.is_finished())      # 重置回设定时长
+
+    def test_settles_even_when_read_after_overshooting(self) -> None:
+        """界面每 100 毫秒才读一次,所以"跑过头再读"是常态,必须也能落定。"""
+        self.countdown.start()
+        self.clock.advance(999.0)
+        self.assertTrue(self.countdown.is_finished())
+        self.assertEqual(self.countdown.remaining_seconds(), 0.0)
+
+    def test_state_read_before_remaining_still_settles(self) -> None:
+        """先读 state 还是先读读数,结果必须一样。
+
+        落定发生在读操作里,所以两个入口都得触发它 —— 只在一个入口做的话,
+        调用顺序就会改变结果,那是最难查的一类 bug。
+        """
+        self.countdown.start()
+        self.clock.advance(10.0)
+        self.assertIs(self.countdown.state, State.IDLE)      # 先读状态
+        self.assertEqual(self.countdown.remaining_seconds(), 0.0)
+
+    def test_remaining_read_before_state_still_settles(self) -> None:
+        self.countdown.start()
+        self.clock.advance(10.0)
+        self.assertEqual(self.countdown.remaining_seconds(), 0.0)  # 先读读数
+        self.assertIs(self.countdown.state, State.IDLE)
+
+    def test_remaining_never_goes_negative(self) -> None:
+        self.countdown.start()
+        self.clock.advance(999.0)
+        self.assertEqual(self.countdown.remaining_seconds(), 0.0)
+
+    def test_start_after_finishing_runs_another_round(self) -> None:
+        """跑完之后停在 00:00:00,这时点"开始"必须能重新跑。
+
+        什么都不做的话,用户在 00:00:00 上点开始会毫无反应,像程序坏了。
+        """
+        self.countdown.start()
+        self.clock.advance(10.0)
+        self.assertTrue(self.countdown.start())
+        self.assertIs(self.countdown.state, State.RUNNING)
+        self.assertEqual(self.countdown.formatted(), "00:00:10")
+
+    def test_pausing_exactly_at_zero_counts_as_finished(self) -> None:
+        """正好卡在 0 上按暂停,要按"跑完了"处理。
+
+        否则会留下"状态是已暂停、读数却是 00:00:00"这种收不了场的局面 ——
+        按钮写着"开始",点了却什么都不发生(读数已经不能更小了)。
+        """
+        self.countdown.start()
+        self.clock.advance(10.0)
+        self.countdown.pause()
+        self.assertIs(self.countdown.state, State.IDLE)
+        self.assertTrue(self.countdown.is_finished())
+
+    def test_countdown_does_not_drift_over_many_cycles(self) -> None:
+        countdown, clock = make_countdown(100)
+        for _ in range(1000):
+            countdown.start()
+            clock.advance(0.1)
+            countdown.pause()
+        self.assertAlmostEqual(countdown.remaining_seconds(), 0.0, delta=1e-6)
+
+
+class ParseHmsTest(unittest.TestCase):
+    """用户手打的时长 -> 秒数。"""
+
+    def test_three_fields(self) -> None:
+        self.assertEqual(parse_hms("1:30:00"), 5400)
+        self.assertEqual(parse_hms("1:02:03"), 3723)
+        self.assertEqual(parse_hms("00:00:01"), 1)
+
+    def test_two_fields_are_minutes_and_seconds(self) -> None:
+        self.assertEqual(parse_hms("05:00"), 300)
+        self.assertEqual(parse_hms("00:01"), 1)
+
+    def test_bare_number_is_seconds(self) -> None:
+        """纯数字按秒算。不能按"分:秒"去校验 —— 那样 90 会被当成
+        "90 分 0 秒"、因为分位 ≥ 60 而被拒,一个合法的秒数就进不去了。"""
+        self.assertEqual(parse_hms("90"), 90)
+        self.assertEqual(parse_hms("5"), 5)
+
+    def test_surrounding_whitespace_is_ignored(self) -> None:
+        self.assertEqual(parse_hms("  05:00  "), 300)
+
+    def test_full_width_colon_is_accepted(self) -> None:
+        """中文输入法下打出来的是全角冒号,字符串看着一模一样。
+        不顺手换掉的话,用户会看到一个完全看不懂为什么失败的报错。"""
+        self.assertEqual(parse_hms("1：30"), 90)
+
+    def test_accepts_the_maximum(self) -> None:
+        self.assertEqual(parse_hms("99:59:59"), MAX_COUNTDOWN_SECONDS)
+
+    def test_rejects_garbage(self) -> None:
+        for bad in ("", "   ", "abc", "3.5", "1:2:3:4", "1::30", "-5", "-1:00"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                parse_hms(bad)
+
+    def test_rejects_non_strings(self) -> None:
+        for bad in (None, 300, 3.5, ["05:00"]):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                parse_hms(bad)  # type: ignore[arg-type]
+
+    def test_rejects_zero(self) -> None:
+        for bad in ("0", "00:00", "0:00", "00:00:00"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                parse_hms(bad)
+
+    def test_rejects_out_of_range_minutes_and_seconds(self) -> None:
+        for bad in ("5:99", "99:99", "1:60:00", "1:00:60"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                parse_hms(bad)
+
+    def test_rejects_above_the_maximum(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_hms("100:00:00")
+
+    def test_round_trips_with_format_hms(self) -> None:
+        for seconds in (1, 59, 60, 300, 3599, 3600, 5400, 86399, MAX_COUNTDOWN_SECONDS):
+            with self.subTest(seconds=seconds):
+                self.assertEqual(parse_hms(format_hms(seconds)), seconds)
 
 
 if __name__ == "__main__":

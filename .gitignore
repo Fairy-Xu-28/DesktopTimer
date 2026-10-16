@@ -16,3 +16,6 @@ desktop.ini
 build/
 dist/
 *.spec
+
+# 验证时截的图(给用户看的,不是代码)
+_shots/

@@ -1,4 +1,6 @@
-"""设置的读写 —— 记住配色、透明开关、窗口大小。纯 Python,不依赖 tkinter。
+"""设置的读写 —— 记住窗口大小、位置、上次用的是哪种计时器、倒计时设了多久。
+
+纯 Python,不依赖 tkinter。
 
 设计上只有一条硬要求:**这个模块永远不能抛异常**。
 
@@ -10,7 +12,10 @@ json 文件有关。所以:
 - ``save()`` 遇到任何异常都静默放弃 —— 顶多是这次设置没记住,绝不能让退出流程崩掉
 
 ``load()`` 只对**出问题的那个字段**退回默认值,其余字段照常保留。比如把手改坏
-了颜色但窗口大小是对的,那窗口大小应该还能记住。
+了倒计时时长但窗口大小是对的,那窗口大小应该还能记住。
+
+v2.0.0 起不再记配色和透明开关(用户不再能改),改记 ``mode`` 和 ``target``。
+**老设置文件里多出来的键会被直接忽略** —— 这是刻意的,所以不需要写迁移代码。
 """
 
 from __future__ import annotations
@@ -21,22 +26,48 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from timer_view import DEFAULT_BG, clamp_window_size, normalize_color
+from timer_core import (
+    DEFAULT_COUNTDOWN_SECONDS,
+    MAX_COUNTDOWN_SECONDS,
+    MIN_COUNTDOWN_SECONDS,
+)
+from timer_view import clamp_window_size
 
-__all__ = ["Settings", "load", "save", "default_path", "APP_DIR_NAME"]
+__all__ = [
+    "Settings",
+    "load",
+    "save",
+    "default_path",
+    "APP_DIR_NAME",
+    "MODE_WATCH",
+    "MODE_COUNTDOWN",
+    "MODES",
+]
 
 APP_DIR_NAME = "DesktopTimer"
 FILE_NAME = "settings.json"
+
+# 两种计时模式。用字符串而不是枚举,是因为它要直接写进 json ——
+# 写 "watch" 比写 0 或者 "State.WATCH" 都更好懂,用户打开文件也看得明白。
+MODE_WATCH = "watch"
+MODE_COUNTDOWN = "countdown"
+MODES = (MODE_WATCH, MODE_COUNTDOWN)
 
 
 @dataclass(frozen=True)
 class Settings:
     """一次运行需要记住的全部设置。"""
 
-    bg: str = DEFAULT_BG
-    transparent: bool = False
-    width: int | None = None    # None 表示"没存过",交给界面用自然尺寸
+    # 上次用的是哪种计时器。下次打开接着上次的模式,不用每次重新切。
+    mode: str = MODE_WATCH
+    # 上次设的倒计时时长(秒)。
+    target: int = DEFAULT_COUNTDOWN_SECONDS
+    width: int | None = None    # None 表示"没存过",交给界面用默认尺寸
     height: int | None = None
+    # 窗口位置。无边框窗口没有标题栏、也不进任务栏,位置记不住的话
+    # 用户下次只能在屏幕正中重新找它 —— 所以这一项是跟着无边框一起来的。
+    x: int | None = None
+    y: int | None = None
 
 
 def default_path() -> Path:
@@ -59,17 +90,21 @@ def default_path() -> Path:
 # ---------------- 字段校验 ----------------
 # 每一个都保证:拿到任何垃圾输入都返回一个能用的值,不抛异常。
 
-def _coerce_bg(raw: Any) -> str:
-    try:
-        return normalize_color(raw)
-    except (ValueError, TypeError):
-        return DEFAULT_BG
+def _coerce_mode(raw: Any) -> str:
+    return raw if raw in MODES else MODE_WATCH
 
 
-def _coerce_bool(raw: Any) -> bool:
-    # 只认真正的布尔值。字符串 "false" 在 Python 里是非空字符串(真值),
-    # 如果拿它当布尔用,用户把设置改成 "false" 反而会打开透明。
-    return raw if isinstance(raw, bool) else False
+def _coerce_target(raw: Any) -> int:
+    """倒计时时长。
+
+    越界不是退回默认值而是**钳到边界** —— 用户把 "target" 手改成 3 小时,
+    看到的是"时长变成了最长能设的那个值",比"莫名其妙变回 5 分钟"好懂。
+    类型不对(字符串、小数、布尔)才退回默认值。
+    """
+    # bool 是 int 的子类,不先排除的话 True 会被当成 1 秒
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return DEFAULT_COUNTDOWN_SECONDS
+    return max(MIN_COUNTDOWN_SECONDS, min(MAX_COUNTDOWN_SECONDS, raw))
 
 
 def _coerce_int(raw: Any) -> int | None:
@@ -79,31 +114,44 @@ def _coerce_int(raw: Any) -> int | None:
     return raw
 
 
-def _coerce_size(data: dict[str, Any]) -> tuple[int | None, int | None]:
-    """宽高要么都有、要么都没有 —— 只有一边没意义,而且会让窗口比例很奇怪。"""
-    width = _coerce_int(data.get("width"))
-    height = _coerce_int(data.get("height"))
-    if width is None or height is None:
+def _coerce_pair(
+    data: dict[str, Any], first: str, second: str
+) -> tuple[int | None, int | None]:
+    """成对读两个整数,要么都有、要么都没有。
+
+    尺寸和位置都是这种"成对才有意义"的东西:只有一个宽度没意义,
+    只有一个 x 也一样。缺一半就当整对没存过。
+    """
+    one = _coerce_int(data.get(first))
+    other = _coerce_int(data.get(second))
+    if one is None or other is None:
         return None, None
-    return clamp_window_size(width, height)
+    return one, other
 
 
 def _from_dict(data: dict[str, Any]) -> Settings:
-    width, height = _coerce_size(data)
+    width, height = _coerce_pair(data, "width", "height")
+    if width is not None and height is not None:
+        width, height = clamp_window_size(width, height)
+    x, y = _coerce_pair(data, "x", "y")
     return Settings(
-        bg=_coerce_bg(data.get("bg")),
-        transparent=_coerce_bool(data.get("transparent")),
+        mode=_coerce_mode(data.get("mode")),
+        target=_coerce_target(data.get("target")),
         width=width,
         height=height,
+        x=x,
+        y=y,
     )
 
 
 def _to_dict(settings: Settings) -> dict[str, Any]:
     return {
-        "bg": settings.bg,
-        "transparent": settings.transparent,
+        "mode": settings.mode,
+        "target": settings.target,
         "width": settings.width,
         "height": settings.height,
+        "x": settings.x,
+        "y": settings.y,
     }
 
 
