@@ -252,3 +252,79 @@ http.proxy = http://127.0.0.1:7897
 ```bash
 git config http.proxy http://127.0.0.1:新端口
 ```
+
+## 十三、发布新版本（打 tag + 发 Release）
+
+### 为什么 exe 不直接提交进仓库
+
+**不要 `git add dist/DesktopTimer.exe`。** 每次迭代都会往仓库里存一份 8 MB 的新副本，而且 git 保留全部历史——以后即使删掉，旧的那几份也还在 `.git` 里，仓库会迅速膨胀到几百 MB，别人 clone 一次要等很久。
+
+正确做法是走 **GitHub Release**：仓库里只存代码和一个 **tag**（钉在某个提交上的名字），exe 作为 Release 的**附件**挂在 tag 上。
+
+```
+仓库里存的：代码 + tag
+                │
+                ├── v1.0.0 ──► Release「v1.0.0」──► 附件 DesktopTimer.exe
+                ├── v1.1.0 ──► Release「v1.1.0」──► 附件 DesktopTimer.exe
+                └── ...
+```
+
+好处：每个版本都能单独下载、互不覆盖；想回看某个版本的源码，切到对应 tag 即可；仓库本体始终只有代码，大小不变。
+
+### 版本号约定
+
+三段式 `v主.次.修`：
+
+| 这次改了什么 | 版本号 |
+| --- | --- |
+| 修 bug、改文案 | v1.0.1 |
+| 加新功能（不影响旧用法） | v1.1.0 |
+| 大改、不兼容旧用法 | v2.0.0 |
+
+当前最新版本：**v1.0.0**
+
+### 发版四步
+
+**第 1 步：改代码，测试通过**
+
+```bash
+python -m unittest discover -s tests -t . -v
+```
+
+**第 2 步：重新打包 exe**
+
+```bash
+.venv/Scripts/python.exe -m PyInstaller --onefile --windowed --name DesktopTimer --clean --noconfirm --noupx timer.py
+```
+
+**第 3 步：打 tag 并推送**
+
+```bash
+git tag v1.1.0
+git push origin v1.1.0
+```
+
+tag 打完，v1.1.0 这一刻的代码就被永久记住了，以后随时切回去看：
+
+```bash
+git checkout v1.1.0    # 切到 v1.1.0 当时的代码
+git checkout main      # 切回最新
+```
+
+**第 4 步：在 GitHub 网页上建 Release**
+
+1. 打开 https://github.com/Fairy-Xu-28/DesktopTimer/releases
+2. 点 **Draft a new release**
+3. **Choose a tag** 下拉里选刚才推上去的 `v1.1.0`
+4. **Release title** 填 `v1.1.0`，或写人话如 `v1.1.0 新增计次功能`
+5. **Describe this release** 写这次改了什么——这段是给下载的人看的更新日志
+6. 把 `dist\DesktopTimer.exe` **拖进**最下方附件区（那里有一行小字 "Attach binaries by dropping them here"）
+7. 点 **Publish release**
+
+发布后，任何人在 Releases 页面就能直接下载 exe，不需要懂 Python、不需要装环境。
+
+### 让 Claude 代做
+
+跟我说「**发布 v1.1.0**」，我负责前三步：跑测试 → 打包 exe → 打 tag 并推送，然后把 tag 名和文件清单报给你确认。**第 4 步的网页上传需要你自己点**——本机没装 `gh` 命令行工具，浏览器拖拽是最省事的方式。
+
+如果你以后嫌这一步麻烦，有两个升级选项：装 `gh` 之后我能一条命令全做完（连 exe 上传）；或者配 GitHub Actions，推 tag 后 GitHub 自己打包并发布，你本地连 PyInstaller 都不用跑。跟我说一声就行。
